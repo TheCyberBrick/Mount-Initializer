@@ -1,6 +1,7 @@
 using ASCOM.DeviceInterface;
 using ASCOM.DriverAccess;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 
@@ -10,10 +11,20 @@ class MountInitializer
     {
         string GetArgument(string option) => args.SkipWhile(i => !i.Equals(option)).Skip(1).Take(1).FirstOrDefault();
 
+        var condition = args.Contains("--condition") ? GetArgument("--condition") : null;
         var telescopeId = args.Contains("--telescope") ? GetArgument("--telescope") : null;
         var timeout = args.Contains("--timeout") ? int.TryParse(GetArgument("--timeout"), out var t) ? t : 60 : 60;
         var silent = args.Contains("--silent");
-        var force = args.Contains("--force");
+        var status = args.Contains("--status");
+        var unpark = args.Contains("--unpark");
+        var stopTracking = args.Contains("--stopTracking");
+        var check = args.Contains("--check");
+
+        if (condition == null)
+        {
+            Console.Error.WriteLine("No condition specified");
+            return 2;
+        }
 
         try
         {
@@ -21,6 +32,8 @@ class MountInitializer
             telescopeId = telescopeId ?? Telescope.Choose("ASCOM.Simulator.Telescope");
 
             Telescope telescope = new Telescope(telescopeId);
+
+            bool conditionMet = false;
 
             try
             {
@@ -40,62 +53,119 @@ class MountInitializer
                     throw new Exception("Failed connecting to mount", ex);
                 }
 
-                // Ensure mount supports syncing
-                if (!telescope.CanSync)
+                conditionMet = condition == "always" || (condition == "unknownSideOfPier" && telescope.SideOfPier == PierSide.pierUnknown);
+
+                if (!check)
                 {
-                    throw new Exception("Mount cannot sync");
-                }
-
-                // Only initialize if pier unknown
-                if (force || telescope.SideOfPier == PierSide.pierUnknown)
-                {
-                    if (!silent)
+                    if (conditionMet)
                     {
-                        Console.WriteLine("Initializing mount");
-                    }
+                        if (!silent)
+                        {
+                            Console.WriteLine("Initializing mount");
+                        }
 
-                    // Counter-weights-down position in RA and DEC coordinates
-                    var cwdRightAscension = (telescope.SiderealTime + 6.0) % 24.0;
-                    var cwdDeclination = 89.999999;
+                        // Ensure mount supports syncing
+                        if (!telescope.CanSync)
+                        {
+                            throw new Exception("Mount cannot sync");
+                        }
 
-                    var syncTime = DateTime.Now;
+                        // Ensure mount is unparked
+                        if (unpark)
+                        {
+                            if (!telescope.CanUnpark)
+                            {
+                                throw new Exception("Mount cannot unpark");
+                            }
 
-                    if (!silent)
-                    {
-                        Console.WriteLine("Current LST: " + telescope.SiderealTime);
-                        Console.WriteLine("Current declination: " + telescope.Declination + ", expected: " + cwdDeclination);
-                        Console.WriteLine("Current right ascension: " + telescope.RightAscension + ", expected: " + cwdRightAscension);
-                        Console.WriteLine("Syncing...");
-                    }
+                            if (!silent)
+                            {
+                                Console.WriteLine("Unparking...");
+                            }
 
-                    // Sync to CWD coordinates
-                    try
-                    {
-                        // Must be tracking to sync
-                        telescope.Tracking = true;
-                        telescope.SyncToCoordinates(cwdRightAscension, cwdDeclination);
-                        telescope.Tracking = false;
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new Exception("Failed syncing mount", ex);
-                    }
+                            telescope.Unpark();
+                        }
+                        else if (telescope.AtPark)
+                        {
+                            throw new Exception("Mount is parked");
+                        }
 
-                    int time = 0;
-                    while (true)
-                    {
-                        bool retry = time++ < timeout;
+                        // Counter-weights-down position in RA and DEC coordinates
+                        var cwdRightAscension = (telescope.SiderealTime + 6.0) % 24.0;
+                        var cwdDeclination = 89.999999;
 
-                        Thread.Sleep(TimeSpan.FromSeconds(1));
+                        var syncTime = DateTime.Now;
 
                         if (!silent)
                         {
-                            Console.WriteLine("Checking status...");
+                            Console.WriteLine("Current LST: " + telescope.SiderealTime);
+                            Console.WriteLine("Current declination: " + telescope.Declination + ", expected: " + cwdDeclination);
+                            Console.WriteLine("Current right ascension: " + telescope.RightAscension + ", expected: " + cwdRightAscension);
+                            Console.WriteLine("Syncing...");
                         }
 
-                        // Wait for side of pier to no longer be unknown
-                        if (telescope.SideOfPier != PierSide.pierUnknown)
+                        // Sync to CWD coordinates
+                        try
                         {
+                            bool prevTracking = telescope.Tracking;
+
+                            // Must be tracking to sync
+                            telescope.Tracking = true;
+                            telescope.SyncToCoordinates(cwdRightAscension, cwdDeclination);
+
+                            telescope.Tracking = stopTracking ? false : prevTracking;
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new Exception("Failed syncing mount", ex);
+                        }
+
+                        var timeoutStart = DateTime.Now;
+                        while (true)
+                        {
+                            bool retry = (DateTime.Now - timeoutStart).Seconds < timeout;
+
+                            Thread.Sleep(TimeSpan.FromSeconds(1));
+
+                            if (!silent)
+                            {
+                                Console.WriteLine("Checking status...");
+                            }
+
+                            // Ensure mount tracking state is correct
+                            if (stopTracking && telescope.Tracking)
+                            {
+                                if (!retry)
+                                {
+                                    throw new Exception("Mount is still tracking");
+                                }
+                                else
+                                {
+                                    if (!silent)
+                                    {
+                                        Console.WriteLine("Tracking not ready");
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Ensure side of pier is correct
+                            if (telescope.SideOfPier == PierSide.pierUnknown)
+                            {
+                                if (!retry)
+                                {
+                                    throw new Exception("Mount is still reporting unknown side of pier");
+                                }
+                                else
+                                {
+                                    if (!silent)
+                                    {
+                                        Console.WriteLine("Side of pier not ready");
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Ensure declination is correct (+-0.01°)
                             var currentDec = telescope.Declination;
                             if (currentDec < 89.99 || currentDec > 90.0)
@@ -145,19 +215,11 @@ class MountInitializer
 
                             break;
                         }
-                        else if (!retry)
-                        {
-                            throw new Exception("Mount is still reporting unknown side of pier");
-                        }
-                        else if (!silent)
-                        {
-                            Console.WriteLine("Side of pier not ready");
-                        }
                     }
-                }
-                else if (!silent)
-                {
-                    Console.WriteLine("Mount already initialized");
+                    else if (!silent)
+                    {
+                        Console.WriteLine("Mount already initialized");
+                    }
                 }
             }
             finally
@@ -174,8 +236,23 @@ class MountInitializer
                 telescope.Dispose();
             }
 
-            Console.WriteLine("OK");
-            return 0;
+
+            if (check)
+            {
+                if (status)
+                {
+                    Console.WriteLine(conditionMet ? "OK" : "FAILURE");
+                }
+                return conditionMet ? 0 : 1;
+            }
+            else
+            {
+                if (status)
+                {
+                    Console.WriteLine("OK");
+                }
+                return 0;
+            }
         }
         catch (Exception ex)
         {
@@ -183,17 +260,20 @@ class MountInitializer
             {
                 if (ex.InnerException != null)
                 {
-                    Console.WriteLine(ex.Message + ":");
-                    Console.WriteLine(ex.InnerException.Message);
+                    Console.Error.WriteLine(ex.Message + ":");
+                    Console.Error.WriteLine(ex.InnerException.Message);
                 }
                 else
                 {
-                    Console.WriteLine(ex.Message);
+                    Console.Error.WriteLine(ex.Message);
                 }
             }
         }
 
-        Console.WriteLine("FAIL");
-        return -1;
+        if (status)
+        {
+            Console.WriteLine("FAILURE");
+        }
+        return 1;
     }
 }
