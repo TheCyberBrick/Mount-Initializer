@@ -17,6 +17,7 @@ class MountInitializer
         var silent = args.Contains("--silent");
         var status = args.Contains("--status");
         var unpark = args.Contains("--unpark");
+        var setpark = args.Contains("--setpark");
         var stopTracking = args.Contains("--stopTracking");
         var check = args.Contains("--check");
 
@@ -70,6 +71,8 @@ class MountInitializer
                             throw new Exception("Mount cannot sync");
                         }
 
+                        var timeoutStart = DateTime.Now;
+
                         // Ensure mount is unparked
                         if (unpark)
                         {
@@ -84,10 +87,44 @@ class MountInitializer
                             }
 
                             telescope.Unpark();
+
+                            while (true)
+                            {
+                                bool retry = (DateTime.Now - timeoutStart).Seconds < timeout;
+
+                                Thread.Sleep(TimeSpan.FromSeconds(1));
+
+                                if (!silent)
+                                {
+                                    Console.WriteLine("Checking unpark status...");
+                                }
+
+                                if (telescope.AtPark)
+                                {
+                                    if (!retry)
+                                    {
+                                        throw new Exception("Mount is still parked");
+                                    }
+                                    else if (!silent)
+                                    {
+                                        Console.WriteLine("Mount unpark not ready");
+                                    }
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
                         }
                         else if (telescope.AtPark)
                         {
                             throw new Exception("Mount is parked");
+                        }
+
+                        // Check if park position can be set, if enabled
+                        if (setpark && !telescope.CanSetPark)
+                        {
+                            throw new Exception("Mount park position cannot be set");
                         }
 
                         // Counter-weights-down position in RA and DEC coordinates
@@ -120,16 +157,26 @@ class MountInitializer
                             throw new Exception("Failed syncing mount", ex);
                         }
 
-                        var timeoutStart = DateTime.Now;
+                        bool checkAfterPark = false;
+                        timeoutStart = DateTime.Now;
                         while (true)
                         {
-                            bool retry = (DateTime.Now - timeoutStart).Seconds < timeout;
+                            bool isCheckingAfterPark = checkAfterPark;
+                            checkAfterPark = false;
+
+                            bool retry = isCheckingAfterPark || (DateTime.Now - timeoutStart).Seconds < timeout;
 
                             Thread.Sleep(TimeSpan.FromSeconds(1));
 
                             if (!silent)
                             {
                                 Console.WriteLine("Checking status...");
+                            }
+
+                            // Ensure mount is not parked
+                            if (telescope.AtPark)
+                            {
+                                throw new Exception("Mount is still parked");
                             }
 
                             // Ensure mount tracking state is correct
@@ -145,6 +192,7 @@ class MountInitializer
                                     {
                                         Console.WriteLine("Tracking not ready");
                                     }
+                                    telescope.Tracking = false;
                                     continue;
                                 }
                             }
@@ -204,6 +252,28 @@ class MountInitializer
                                     }
                                     continue;
                                 }
+                            }
+
+                            // Everything ready, now set park position if enabled
+                            if (setpark && !isCheckingAfterPark)
+                            {
+                                if (!telescope.CanSetPark)
+                                {
+                                    throw new Exception("Mount park position cannot be set");
+                                }
+
+                                if (!silent)
+                                {
+                                    Console.WriteLine("Setting park position...");
+                                }
+
+                                telescope.SetPark();
+
+                                // Check everything again one more time
+                                // after setting park position to ensure
+                                // that the position is still correct
+                                checkAfterPark = true;
+                                continue;
                             }
 
                             // Successfully initialized
